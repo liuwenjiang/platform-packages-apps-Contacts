@@ -21,6 +21,7 @@ import android.app.Fragment;
 import android.app.FragmentManager;
 import android.app.FragmentTransaction;
 import android.content.ActivityNotFoundException;
+import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.Context;
 import android.content.BroadcastReceiver;
@@ -56,6 +57,7 @@ import android.widget.Toolbar;
 
 import com.android.contacts.ContactsActivity;
 import com.android.contacts.R;
+import com.android.contacts.RcsApiManager;
 import com.android.contacts.activities.ActionBarAdapter.TabState;
 import com.android.contacts.common.ContactsUtils;
 import com.android.contacts.common.activity.RequestPermissionsActivity;
@@ -85,6 +87,7 @@ import com.android.contacts.list.ContactTileListFragment;
 import com.android.contacts.list.ContactsIntentResolver;
 import com.android.contacts.list.ContactsRequest;
 import com.android.contacts.list.ContactsUnavailableFragment;
+import com.android.contacts.list.ContactsUpdateFragment;
 import com.android.contacts.common.list.DirectoryListLoader;
 import com.android.contacts.common.preference.DisplayOptionsPreferenceFragment;
 import com.android.contacts.list.OnContactBrowserActionListener;
@@ -103,6 +106,7 @@ import com.android.contacts.common.util.Constants;
 import com.android.contacts.common.vcard.ExportVCardActivity;
 import com.android.contacts.common.vcard.VCardCommonArguments;
 import com.android.contacts.util.DialogManager;
+import com.android.contacts.util.RcsUtils;
 import com.android.contactsbind.HelpUtils;
 
 import java.util.List;
@@ -134,11 +138,11 @@ public class PeopleActivity extends ContactsActivity implements
     private static final int SUBACTIVITY_ACCOUNT_FILTER = 2;
     private static final int SUBACTIVITY_NEW_GROUP = 4;
     private static final int SUBACTIVITY_EDIT_GROUP = 5;
+    private static final int START_CAPTURE = 109;
     private final DialogManager mDialogManager = new DialogManager(this);
 
     private ContactsIntentResolver mIntentResolver;
     private ContactsRequest mRequest;
-
     private ActionBarAdapter mActionBarAdapter;
     private FloatingActionButtonController mFloatingActionButtonController;
     private GroupDetailFragment mGroupDetailFragment;
@@ -277,6 +281,9 @@ public class PeopleActivity extends ContactsActivity implements
         }
         getWindow().setBackgroundDrawable(null);
         registerReceiver();
+        if (RcsApiManager.getSupportApi().isRcsSupported()) {
+            RcsUtils.resotreIfTerminalChanged(this, RcsUtils.RESTORE_CONTACTS, null, null);
+        }
     }
 
     @Override
@@ -1239,6 +1246,11 @@ public class PeopleActivity extends ContactsActivity implements
 
         // Get references to individual menu items in the menu
         final MenuItem contactsFilterMenu = menu.findItem(R.id.menu_contacts_filter);
+
+        final MenuItem scanMenu = menu.findItem(R.id.menu_scan);
+        final MenuItem cloudMenu = menu.findItem(R.id.menu_cloud);
+        final MenuItem contactsPhotoUpdateMenu = menu.findItem(R.id.menu_contacts_photo_update);
+
         MenuItem addGroupMenu = menu.findItem(R.id.menu_add_group);
         final MenuItem clearFrequentsMenu = menu.findItem(R.id.menu_clear_frequents);
         final MenuItem helpMenu = menu.findItem(R.id.menu_help);
@@ -1251,17 +1263,32 @@ public class PeopleActivity extends ContactsActivity implements
             clearFrequentsMenu.setVisible(false);
             helpMenu.setVisible(false);
             makeMenuItemVisible(menu, R.id.menu_delete, false);
+            // RCS Menus
+            contactsPhotoUpdateMenu.setVisible(false);
+            cloudMenu.setVisible(false);
+            scanMenu.setVisible(false);
         } else {
             switch (getTabPositionForTextDirection(mActionBarAdapter.getCurrentTab())) {
                 case TabState.FAVORITES:
                     addGroupMenu.setVisible(false);
                     contactsFilterMenu.setVisible(false);
                     clearFrequentsMenu.setVisible(hasFrequents());
+                    // RCS Menus
+                    contactsPhotoUpdateMenu.setVisible(false);
+                    cloudMenu.setVisible(false);
+                    scanMenu.setVisible(false);
                     break;
                 case TabState.ALL:
                     addGroupMenu.setVisible(false);
                     contactsFilterMenu.setVisible(true);
                     clearFrequentsMenu.setVisible(false);
+                    // RCS Menus
+                    boolean isRcsSupport = RcsApiManager.getSupportApi().isRcsSupported();
+                    boolean isRcsPluginInstalled = RcsUtils.isPluginInstalled(this);
+                    scanMenu.setVisible(isRcsSupport && isRcsPluginInstalled);
+                    cloudMenu.setVisible(isRcsSupport && RcsUtils.isNativeUIInstalled &&
+                            isRcsPluginInstalled);
+                    contactsPhotoUpdateMenu.setVisible(isRcsSupport && isRcsPluginInstalled);
                     break;
                 case TabState.GROUPS:
                     // Do not display the "new group" button if no accounts are available
@@ -1273,6 +1300,11 @@ public class PeopleActivity extends ContactsActivity implements
                     addGroupMenu.setVisible(true);
                     contactsFilterMenu.setVisible(false);
                     clearFrequentsMenu.setVisible(false);
+                    // RCS Menus
+                    contactsPhotoUpdateMenu.setVisible(false);
+                    cloudMenu.setVisible(false);
+                    scanMenu.setVisible(false);
+                    break;
             }
             helpMenu.setVisible(HelpUtils.isHelpAndFeedbackAvailable());
         }
@@ -1329,6 +1361,17 @@ public class PeopleActivity extends ContactsActivity implements
                 if (mActionBarAdapter.isUpShowing()) {
                     // "UP" icon press -- should be treated as "back".
                     onBackPressed();
+                }
+                return true;
+            }
+            case R.id.menu_scan:{
+                Intent intent = new Intent("android.intent.action.SCAN_QRCODE");
+                String accnountNumber = RcsUtils.getProfileAccountNumber();
+                intent.putExtra("profile_tel",accnountNumber);
+                try {
+                    startActivityForResult(intent,START_CAPTURE);
+                } catch (ActivityNotFoundException e) {
+                    e.printStackTrace();
                 }
                 return true;
             }
@@ -1405,10 +1448,25 @@ public class PeopleActivity extends ContactsActivity implements
                 ImplicitIntentsUtil.startActivityOutsideApp(this, intent);
                 return true;
             }
+            case R.id.menu_contacts_photo_update: {
+                ContactsUpdateFragment.show(getFragmentManager());
+                return true;
+            }
 
             case R.id.menu_memory_status: {
                 final Intent intent = new Intent(this, MemoryStatusActivity.class);
                 startActivity(intent);
+                return true;
+            }
+
+            case R.id.menu_cloud: {
+                try {
+                    startActivity(new Intent(RcsUtils.ACTION_BACKUP_RESTORE_ACTIVITY));
+                    return true;
+                } catch (ActivityNotFoundException ex) {
+                    Toast.makeText(PeopleActivity.this, R.string.missing_app,
+                            Toast.LENGTH_SHORT).show();
+                }
                 return true;
             }
         }
@@ -1480,6 +1538,11 @@ public class PeopleActivity extends ContactsActivity implements
                         mContactListFilterController, resultCode, data);
                 break;
             }
+            case START_CAPTURE:
+                if (resultCode == RESULT_OK) {
+                    RcsUtils.insertQrcodeContact(this,data);
+                }
+                break;
             case SUBACTIVITY_NEW_GROUP:
             case SUBACTIVITY_EDIT_GROUP: {
                 if (resultCode == RESULT_OK) {

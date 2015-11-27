@@ -16,11 +16,14 @@
 
 package com.android.contacts.group;
 
+import java.util.ArrayList;
 import android.app.Activity;
 import android.app.Fragment;
 import android.app.LoaderManager;
 import android.app.LoaderManager.LoaderCallbacks;
 import android.content.ActivityNotFoundException;
+import android.content.ComponentName;
+import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.Context;
 import android.content.CursorLoader;
@@ -31,8 +34,12 @@ import android.database.Cursor;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.RemoteException;
+
 import android.provider.ContactsContract.Contacts;
+import android.provider.ContactsContract.Data;
 import android.provider.ContactsContract.Groups;
+import android.provider.ContactsContract.CommonDataKinds.Phone;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.LayoutInflater;
@@ -51,16 +58,21 @@ import android.widget.Toast;
 import com.android.contacts.GroupMemberLoader;
 import com.android.contacts.GroupMetaDataLoader;
 import com.android.contacts.R;
+import com.android.contacts.RcsApiManager;
+import com.android.contacts.activities.MultiPickContactActivity;
 import com.android.contacts.common.ContactPhotoManager;
 import com.android.contacts.common.util.ImplicitIntentsUtil;
 import com.android.contacts.interactions.GroupDeletionDialogFragment;
 import com.android.contacts.common.list.ContactTileAdapter;
 import com.android.contacts.common.list.ContactTileView;
+import com.android.contacts.util.RcsUtils;
 import com.android.contacts.list.GroupMemberTileAdapter;
 import com.android.contacts.common.model.AccountTypeManager;
 import com.android.contacts.common.model.account.AccountType;
 import com.android.contacts.activities.MultiPickContactActivity;
 import com.android.contacts.common.SimContactsConstants;
+import com.suntek.mway.rcs.client.api.exception.ServiceDisconnectedException;
+import com.suntek.mway.rcs.client.api.richscreen.RichScreenApi;
 
 /**
  * Displays the details of a group and shows a list of actions possible for the group.
@@ -100,7 +112,7 @@ public class GroupDetailFragment extends Fragment implements OnScrollListener {
     private static final int LOADER_MEMBERS = 1;
 
     private Context mContext;
-
+    private ContentResolver mResolver;
     private View mRootView;
     private ViewGroup mGroupSourceViewContainer;
     private View mGroupSourceView;
@@ -127,7 +139,11 @@ public class GroupDetailFragment extends Fragment implements OnScrollListener {
     private boolean mShowGroupActionInActionBar;
     private boolean mOptionsMenuGroupDeletable;
     private boolean mOptionsMenuGroupEditable;
+    private boolean mOptionsMenuRcsSupported;
+    private boolean mOptionsMenuRcsEnhanceScreenSupported;
     private boolean mCloseActivityAfterDelete;
+    private String mGroupMembersPhones;
+    private ArrayList<String> mGroupMembersPhonesList = new ArrayList<String>();
 
     public GroupDetailFragment() {
     }
@@ -144,6 +160,7 @@ public class GroupDetailFragment extends Fragment implements OnScrollListener {
         mAdapter = new GroupMemberTileAdapter(activity, mContactTileListener, columnCount);
 
         configurePhotoLoader();
+        mResolver = mContext.getContentResolver();
     }
 
     @Override
@@ -294,11 +311,43 @@ public class GroupDetailFragment extends Fragment implements OnScrollListener {
             updateSize(data.getCount());
             mAdapter.setContactCursor(data);
             mMemberListView.setEmptyView(mEmptyView);
+            if (data.getCount() > 0) {
+                long[] contactIds = new long[data.getCount()];
+                data.moveToFirst();
+                for(int i = 0; i < data.getCount(); i++) {
+                    contactIds[i] = data.getLong(0);
+                    data.moveToNext();
+                }
+                getGroupMemberPhoneNumber(mContext.getApplicationContext(), contactIds);
+            }
         }
 
         @Override
         public void onLoaderReset(Loader<Cursor> loader) {}
     };
+
+    private void getGroupMemberPhoneNumber(final Context context, final long[] contactIds) {
+        if (contactIds == null) return;
+        new Thread () {
+            @Override
+            public void run() {
+                // For starting RCS group-chat.
+                StringBuilder sb = new StringBuilder();
+                mGroupMembersPhonesList.clear();
+                for (long id : contactIds) {
+                    String phoneNumber = RcsUtils.getPhoneforContactId(context, id);
+                    sb.append(phoneNumber).append(";");
+                    String[] groupMemberPhones = RcsUtils.getAllPhoneNumberFromContactId(context,
+                            id).split(";");
+                    for (int i = 0; i < groupMemberPhones.length; i++) {
+                        mGroupMembersPhonesList.add(RcsUtils.getFormatNumber(groupMemberPhones[i]));
+                    }
+                }
+                Log.d(TAG, "mGroupMembersPhonesList:" + mGroupMembersPhonesList.toString());
+                mGroupMembersPhones = sb.toString();
+            }
+        }.start();
+    }
 
     private void bindGroupMetaData(Cursor cursor) {
         cursor.moveToPosition(-1);
@@ -435,6 +484,9 @@ public class GroupDetailFragment extends Fragment implements OnScrollListener {
     @Override
     public void onCreateOptionsMenu(Menu menu, final MenuInflater inflater) {
         inflater.inflate(R.menu.view_group, menu);
+        mOptionsMenuRcsSupported = RcsApiManager.getSupportApi().isRcsSupported();
+        mOptionsMenuRcsEnhanceScreenSupported = mOptionsMenuRcsSupported
+                && RcsUtils.isEnhanceScreenInstalled(mContext);
     }
 
     public boolean isOptionsMenuChanged() {
@@ -455,6 +507,12 @@ public class GroupDetailFragment extends Fragment implements OnScrollListener {
         mOptionsMenuGroupDeletable = isGroupDeletable() && isVisible();
         mOptionsMenuGroupEditable = isGroupEditableAndPresent() && isVisible();
 
+        final MenuItem optionsGroupChat = menu.findItem(R.id.menu_create_group_chat);
+        optionsGroupChat.setVisible(mOptionsMenuRcsSupported);
+
+        final MenuItem optionsEnhancedscreen = menu.findItem(R.id.menu_enhancedscreen);
+        optionsEnhancedscreen.setVisible(mOptionsMenuRcsEnhanceScreenSupported);
+
         final MenuItem editMenu = menu.findItem(R.id.menu_edit_group);
         editMenu.setVisible(mOptionsMenuGroupEditable);
 
@@ -468,6 +526,25 @@ public class GroupDetailFragment extends Fragment implements OnScrollListener {
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
         switch (item.getItemId()) {
+            case R.id.menu_create_group_chat:{
+                startCreateGroupChatActivity(mGroupMembersPhones);
+                break;
+            }
+            case R.id.menu_enhancedscreen:{
+                try {
+                     if (mGroupMembersPhonesList.size() < 1) {
+                         Toast.makeText(mContext, R.string.Unformatted_profile_phone_number,
+                                 Toast.LENGTH_SHORT).show();
+                     } else {
+                        RichScreenApi.getInstance().startRichScreenApp(mGroupMembersPhonesList);
+                     }
+                } catch (ServiceDisconnectedException e) {
+                    e.printStackTrace();
+                } catch (RemoteException e) {
+                    e.printStackTrace();
+                }
+                 return true;
+             }
             case R.id.menu_edit_group: {
                 if (mListener != null) mListener.onEditRequested(mGroupUri);
                 break;
@@ -491,6 +568,16 @@ public class GroupDetailFragment extends Fragment implements OnScrollListener {
             }
         }
         return false;
+    }
+
+    private void invalidateOptionsMenu(){
+        this.getActivity().invalidateOptionsMenu();
+    }
+
+    public void startCreateGroupChatActivity(String number) {
+        Intent intent = new Intent("com.android.mms.rcs.CREATR_GROUP_CHAT");
+        intent.putExtra("recipients", number);
+        mContext.startActivity(intent);
     }
 
     public void closeActivityAfterDelete(boolean closeActivity) {
